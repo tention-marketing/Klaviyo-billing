@@ -1,0 +1,19 @@
+# Secrets - never commit
+.env
+clients.json
+
+# Local alert state (Postgres is used in production)
+.alert_state.json
+.alert_state.json.tmp
+
+# Python
+*.pyc
+__pycache__/
+.venv/
+venv/
+
+# Local output
+out.json
+results.json
+railway_env.txt
+run.log

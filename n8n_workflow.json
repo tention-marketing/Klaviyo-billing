@@ -1,0 +1,93 @@
+{
+  "name": "Klaviyo Billing -> Discord",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "Klaviyo-Billing",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000001",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -260,
+        0
+      ],
+      "webhookId": "a1000000-0000-4000-8000-000000000001"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Build Discord notifications from the Klaviyo billing payload.\n// Gate: notify on a real reminder or a client failure, never on a duplicate.\n// Accepts both send modes: one client per request, or a batch {clients:[...]}.\n\nconst RED = 15082283;    // over limit / client failed\nconst ORANGE = 16097024; // high usage / period ending\nconst BLUE = 3447003;    // informational\n\nconst num = (v) =>\n  v === null || v === undefined || Number.isNaN(Number(v))\n    ? '\u2014'\n    : Number(v).toLocaleString('en-US');\n\nconst pct = (v) =>\n  v === null || v === undefined || Number.isNaN(Number(v))\n    ? '\u2014'\n    : `${Number(v).toFixed(1)}%`;\n\nconst usage = (used, limit, percent) =>\n  limit === null || limit === undefined\n    ? `${num(used)} (no limit)`\n    : `${num(used)} / ${num(limit)} \u00b7 ${pct(percent)}`;\n\nfunction shouldNotify(c) {\n  if (!c || typeof c !== 'object') return false;\n  if (c.suppressed_duplicate === true) return false;\n  return c.success === false || c.should_remind === true;\n}\n\nfunction severity(c) {\n  const types = c.alert_types || [];\n  if (c.success === false) return RED;\n  if (types.some((t) => String(t).startsWith('over_limit'))) return RED;\n  if (types.length) return ORANGE;\n  return BLUE;\n}\n\nfunction failureEmbed(c) {\n  return {\n    title: `\u26a0\ufe0f Klaviyo check failed \u2014 ${c.client_name}`,\n    color: RED,\n    description:\n      c.error_type === 'auth'\n        ? '**Invalid API key.** This client was skipped; its usage is unknown.'\n        : `Could not read this account: \\`${String(c.error_type || 'unknown')}\\``,\n    fields: [{ name: 'Detail', value: String(c.error || 'No detail').slice(0, 1000) }],\n    footer: { text: `alert ${c.alert_key || 'n/a'}` },\n    timestamp: c.checked_at || new Date().toISOString(),\n  };\n}\n\nfunction reminderEmbed(c) {\n  const days =\n    c.days_until_billing === null || c.days_until_billing === undefined\n      ? '\u2014'\n      : c.days_until_billing < 0\n        ? `ended ${Math.abs(c.days_until_billing)}d ago`\n        : c.days_until_billing === 0\n          ? 'today'\n          : `in ${c.days_until_billing} day${c.days_until_billing === 1 ? '' : 's'}`;\n\n  const endDate = c.billing_period_end\n    ? String(c.billing_period_end).slice(0, 10)\n    : '\u2014';\n\n  const fields = [\n    { name: 'Billing period ends', value: `${endDate} (${days})`, inline: true },\n    { name: 'Campaigns sent', value: num(c.sent_campaign_count), inline: true },\n    {\n      name: 'Avg recipients / email',\n      value: num(c.average_recipients_per_email),\n      inline: true,\n    },\n    {\n      name: 'Profiles',\n      value: usage(c.active_profiles, c.profile_limit, c.profile_usage_percent),\n      inline: true,\n    },\n    {\n      name: 'Email',\n      value: usage(c.email_used, c.email_limit, c.email_usage_percent),\n      inline: true,\n    },\n    {\n      name: 'SMS',\n      value: usage(c.sms_used, c.sms_limit, c.sms_usage_percent),\n      inline: true,\n    },\n  ];\n\n  // Only surface AI / Reviews when they have actually been used.\n  if (Number(c.ai_used) > 0) {\n    fields.push({\n      name: 'AI credits',\n      value: usage(c.ai_used, c.ai_limit, c.ai_usage_percent),\n      inline: true,\n    });\n  }\n  if (Number(c.reviews_used) > 0) {\n    fields.push({\n      name: 'Reviews',\n      value: usage(c.reviews_used, c.reviews_limit, c.reviews_usage_percent),\n      inline: true,\n    });\n  }\n\n  const reasons = (c.reasons || []).map((r) => `\u2022 ${r}`).join('\\n');\n\n  return {\n    title: `\ud83d\udd14 Billing review \u2014 ${c.client_name}`,\n    color: severity(c),\n    description: (reasons || '\u2022 Flagged for review').slice(0, 4000),\n    fields,\n    footer: { text: `alert ${c.alert_key || 'n/a'} \u00b7 human review decides any plan change` },\n    timestamp: c.checked_at || new Date().toISOString(),\n  };\n}\n\nconst out = [];\nfor (const item of $input.all()) {\n  const body = item.json || {};\n  const clients = Array.isArray(body.clients) ? body.clients : [body];\n\n  for (const c of clients) {\n    if (!shouldNotify(c)) continue;\n    out.push({\n      json: {\n        username: 'Klaviyo Billing',\n        embeds: [c.success === false ? failureEmbed(c) : reminderEmbed(c)],\n      },\n    });\n  }\n}\nreturn out;\n"
+      },
+      "id": "a1000000-0000-4000-8000-000000000002",
+      "name": "Check should_remind & Build Discord Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "REPLACE_WITH_YOUR_DISCORD_WEBHOOK_URL",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 1200
+            }
+          }
+        }
+      },
+      "id": "a1000000-0000-4000-8000-000000000003",
+      "name": "Send to Discord",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        280,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Check should_remind & Build Discord Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check should_remind & Build Discord Message": {
+      "main": [
+        [
+          {
+            "node": "Send to Discord",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

@@ -1,0 +1,7 @@
+requests>=2.31,<3
+
+# Encrypted client credentials (AES-256-GCM)
+cryptography>=42
+
+# PostgreSQL: encrypted client store + alert history
+psycopg[binary]>=3.1
