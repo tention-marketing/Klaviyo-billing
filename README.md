@@ -178,54 +178,83 @@ That is the whole production configuration. **No client API keys live in
 Railway variables**, and no `/data` volume is needed — alert history is in
 Postgres.
 
-### 3. Deploy and migrate
+### 3. Deploy — the schema applies itself
 
-Push the code, then run the migration. The easiest way is the Railway CLI from
-your own machine, which injects the service's variables into a local command:
-
-```bash
-npm i -g @railway/cli
-railway login
-railway link                     # pick your project + service
-
-railway run python3 migrate.py
-```
-
-Expected:
-
-```
-Creating klaviyo_clients... created
-Creating klaviyo_alert_history... created
-```
-
-Running it again prints `already exists`. It is idempotent and never drops or
-rewrites data.
-
-### 4. Import your existing clients
-
-Still using `railway run`, so it talks to Railway's Postgres while reading your
-**local** `clients.json`:
+`railway.json` starts `./start.sh`, which runs the migration **inside the
+container** and only then starts the monitor:
 
 ```bash
-railway run python3 manage_clients.py import-json clients.json
+python3 migrate.py     # idempotent; CREATE ... IF NOT EXISTS throughout
+exec python3 index.py  # never reached if the migration fails
 ```
 
-```
-Importing 2 client(s) from clients.json ...
+This has to happen inside Railway. `DATABASE_URL` points at
+`postgres.railway.internal`, which is Railway's **private IPv6 DNS** — it
+resolves inside the container and returns `NXDOMAIN` anywhere else. Running
+`railway run python3 migrate.py` from your laptop therefore fails with
+`failed to resolve host 'postgres.railway.internal'`: `railway run` injects
+Railway's variables but executes on **your machine**, which has no route to
+that network.
 
-Steven Denn                        imported
-AutoLEDTech.com                    imported
+Do **not** swap the private URL for `DATABASE_PUBLIC_URL` to work around this.
 
-2 imported
-0 failed
-```
+### 4. Import your existing clients (one time, over a tunnel)
 
-Your local file is **not** modified or deleted. Verify:
+Client keys are the one thing the container cannot bootstrap itself — the
+plaintext lives only in your local `clients.json`, which is gitignored and
+never baked into the image. Railway's SSH tunnel exposes Postgres on
+`localhost` for this, without making the database public.
+
+The whole sequence is scripted:
 
 ```bash
-railway run python3 manage_clients.py list
-railway run python3 manage_clients.py verify
+./bootstrap_import.sh                # or: ./bootstrap_import.sh path/to/clients.json
 ```
+
+It reads `KLAVIYO_MASTER_KEY` **straight from the Railway service** into a
+shell variable, validates it, opens the tunnel, migrates, imports, lists and
+verifies — then closes the tunnel and unsets both secrets. The key is never
+printed, typed, or written to disk, which matters because importing under a
+different key would store credentials the deployed service cannot decrypt.
+
+<details>
+<summary>Manual equivalent, if you prefer to run the steps yourself</summary>
+
+**Terminal A** — hold the tunnel open:
+
+```bash
+railway connect Postgres --tunnel-only --port 45432
+```
+
+It prints Host / Port / User / Password. **That output contains the database
+password — do not paste it into a shared log.**
+
+**Terminal B** — point at the tunnel and use the *same* master key Railway has:
+
+```bash
+export KLAVIYO_MASTER_KEY="$(railway variables --service Klaviyo-billing --kv \
+  | sed -n 's/^KLAVIYO_MASTER_KEY=//p')"
+
+export DATABASE_URL="$(railway variables --service Postgres --kv \
+  | sed -n 's/^DATABASE_URL=//p' \
+  | sed -E 's#@[^:/]+:[0-9]+#@127.0.0.1:45432#')"
+
+python3 migrate.py
+python3 manage_clients.py import-json clients.json
+python3 manage_clients.py list
+python3 manage_clients.py verify
+
+unset DATABASE_URL KLAVIYO_MASTER_KEY
+```
+
+Both `export` lines capture values into variables without displaying them.
+Then Ctrl+C Terminal A.
+
+</details>
+
+Note: `railway run` cannot be combined with a tunnel — Railway's injected
+variables take precedence over your shell, so its private `DATABASE_URL`
+would override the tunnel URL.
 
 ### 5. Test, then schedule
 
@@ -237,6 +266,11 @@ railway run python3 index.py --force       # real n8n -> Discord test
 Then set the service's **Cron Schedule** to `0 9 * * *`. `railway.json` keeps
 `restartPolicyType: NEVER` so the container runs once and exits rather than
 being treated as a crashed web service.
+
+**Until the import is done, the service is expected to fail.** With a valid
+schema but no active clients, `index.py` exits non-zero with "No active clients
+in the database". That is deliberate: a zero-client run must never look like a
+successful monitoring run. Redeploy after importing.
 
 After this, production no longer needs `clients.json` at all. Keep it locally
 as a backup, or delete it once you trust the database.

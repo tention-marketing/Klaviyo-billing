@@ -4,7 +4,7 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "python3 index.py",
+    "startCommand": "./start.sh",
     "restartPolicyType": "NEVER"
   }
 }
