@@ -5,6 +5,7 @@
   },
   "deploy": {
     "startCommand": "./start.sh",
+    "cronSchedule": "0 9 * * *",
     "restartPolicyType": "NEVER"
   }
 }
