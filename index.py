@@ -201,6 +201,17 @@ USAGE_METRICS: Dict[str, Tuple[str, str, bool]] = {
     "reviews_orders": ("reviews", "Reviews", False),
 }
 
+# The only billing-usage ids that can raise a usage alert (high usage or over
+# limit). Everything else - AI credits, reviews, Customer Hub, K Social and any
+# metric Klaviyo adds later - is still reported but never flags an account.
+# Add-on allowances are often tiny (e.g. 250) and routinely read thousands of
+# percent "over", which drowned out the real billing warnings.
+ALERTABLE_USAGE_METRICS = frozenset({
+    "active_profiles",
+    "email_sends",
+    "sms_credits",
+})
+
 
 # ============================================================
 # LOGGING (with API-key redaction)
@@ -851,8 +862,8 @@ def build_reminder(
     metrics: Dict[str, Dict[str, Any]], days_until_billing: int
 ) -> Tuple[bool, List[str], List[str]]:
     """
-    Flag the account when the billing period is nearly over, any metric has
-    gone over its limit, or an important metric is close to its limit.
+    Flag the account when the billing period is nearly over, or a metric in
+    ALERTABLE_USAGE_METRICS is over or close to its limit.
 
     Returns (should_remind, human reasons, machine-readable alert types).
     The alert types are what duplicate suppression keys off, so an account
@@ -887,6 +898,8 @@ def build_reminder(
         metrics, key=lambda key: list(USAGE_METRICS).index(key)
         if key in USAGE_METRICS else len(USAGE_METRICS)
     ):
+        if metric_id not in ALERTABLE_USAGE_METRICS:
+            continue
         metric = metrics[metric_id]
         if metric["over_limit"]:
             over_limit = True

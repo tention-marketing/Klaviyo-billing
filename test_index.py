@@ -132,8 +132,131 @@ def test_reminder():
     over = {"ai_credits": {"label": "AI credits", "important": False, "used": 150,
                            "limit": 100, "percent": 150.0, "over_limit": True,
                            "high_usage": True}}
-    check("any over limit -> remind", m.build_reminder(over, 30)[0], True)
-    check("over limit alert type", m.build_reminder(over, 30)[2], ["over_limit:ai_credits"])
+    check("non-core over limit -> no remind", m.build_reminder(over, 30), (False, [], []))
+
+
+def _billing_item(metric_id, used, limit, unit="profiles"):
+    return {"id": metric_id, "attributes": {
+        "usage_used": used, "usage_max": limit, "unit": unit,
+        "period_start": "2026-10-01T00:00:00Z", "period_end": "2026-11-01T00:00:00Z"}}
+
+
+def test_excluded_metrics():
+    section("Only Profiles / Email / SMS raise usage alerts")
+    # 6405 / 250 = 2562% - the real-world numbers that caused noisy alerts.
+    hub = _billing_item("customer_hub_active_profiles", 6405, 250)
+    social = _billing_item("k_social_active_profiles", 6405, 250)
+    safe = [_billing_item("active_profiles", 3250, 6500),
+            _billing_item("email_sends", 2000, 10000, "messages"),
+            _billing_item("sms_credits", 10, 100, "USD")]
+
+    def remind(items, days=20):
+        return m.build_reminder(m.parse_billing_usage({"data": items})["metrics"], days)
+
+    check("allowlist is exactly the core metrics", m.ALERTABLE_USAGE_METRICS,
+          frozenset({"active_profiles", "email_sends", "sms_credits"}))
+
+    check("profiles 98% -> high_usage",
+          remind([_billing_item("active_profiles", 6370, 6500)] + safe[1:]),
+          (True, ["Profiles usage is at 98.0%"], ["high_usage:active_profiles"]))
+    check("email 95% -> high_usage",
+          remind([safe[0], _billing_item("email_sends", 9500, 10000, "messages"), safe[2]]),
+          (True, ["Email usage is at 95.0%"], ["high_usage:email_sends"]))
+    check("sms 96% -> high_usage",
+          remind(safe[:2] + [_billing_item("sms_credits", 96, 100, "USD")]),
+          (True, ["SMS usage is at 96.0%"], ["high_usage:sms_credits"]))
+    check("profiles 105% -> over_limit",
+          remind([_billing_item("active_profiles", 6825, 6500)] + safe[1:]),
+          (True, ["Profiles usage is over its limit (105.0%)"],
+           ["over_limit:active_profiles"]))
+    check("ai credits 500% -> no remind",
+          remind(safe + [_billing_item("ai_credits", 500, 100, "credits")]), (False, [], []))
+    check("reviews 500% -> no remind",
+          remind(safe + [_billing_item("reviews_orders", 500, 100, "orders")]), (False, [], []))
+    check("hub / k social 20,000% -> no remind",
+          remind(safe + [_billing_item("customer_hub_active_profiles", 50000, 250),
+                         _billing_item("k_social_active_profiles", 50000, 250)]),
+          (False, [], []))
+    check("helpdesk / ai resolutions over -> no remind",
+          remind(safe + [_billing_item("helpdesk_conversations", 900, 800, "conversations"),
+                         _billing_item("ai_resolutions", 900, 750, "resolutions")]),
+          (False, [], []))
+    check("unknown future metric over limit -> no remind",
+          remind(safe + [_billing_item("future_metric_klaviyo_adds", 10, 0, "things")]),
+          (False, [], []))
+    check("billing ending, usage normal -> remind",
+          remind(safe, days=m.REMINDER_DAYS),
+          (True, ["Billing period ends in {} days".format(m.REMINDER_DAYS)],
+           ["billing_period_ending"]))
+    check("2562% is computed for hub",
+          m.parse_billing_usage({"data": [hub]})["metrics"]["customer_hub_active_profiles"]["percent"],
+          2562.0)
+
+    check("main profiles 98.95% -> remind",
+          remind([_billing_item("active_profiles", 6432, 6500), hub, social]),
+          (True, ["Profiles usage is at 98.95%"], ["high_usage:active_profiles"]))
+    check("customer hub 2562% alone -> no remind", remind([hub]), (False, [], []))
+    check("k social 2562% alone -> no remind", remind([social]), (False, [], []))
+    check("both optional high, main safe -> no remind",
+          remind(safe + [hub, social]), (False, [], []))
+    check("sms 95% + optional high -> only sms",
+          remind([_billing_item("active_profiles", 3250, 6500),
+                  _billing_item("email_sends", 2000, 10000, "messages"),
+                  _billing_item("sms_credits", 95, 100, "USD"), hub, social]),
+          (True, ["SMS usage is at 95.0%"], ["high_usage:sms_credits"]))
+    check("main profiles over 100% -> remind",
+          remind([_billing_item("active_profiles", 7000, 6500), hub, social]),
+          (True, ["Profiles usage is over its limit (107.69%)"],
+           ["over_limit:active_profiles"]))
+    check("billing ending + optional high -> period only",
+          remind(safe + [hub, social], days=2),
+          (True, ["Billing period ends in 2 days"], ["billing_period_ending"]))
+
+
+def test_excluded_metrics_preserved():
+    section("Customer Hub / K Social still reported in other_usage")
+    response = {"data": [
+        _billing_item("active_profiles", 3250, 6500),
+        _billing_item("email_sends", 2000, 10000, "messages"),
+        _billing_item("sms_credits", 10, 100, "USD"),
+        _billing_item("customer_hub_active_profiles", 6405, 250),
+        _billing_item("k_social_active_profiles", 6405, 250),
+        _billing_item("ai_credits", 500, 100, "credits"),
+        _billing_item("reviews_orders", 500, 100, "orders"),
+        _billing_item("future_metric_klaviyo_adds", 10, 5, "things"),
+    ]}
+
+    class FakeRecord:
+        client_name = "Excluded Metrics Client"
+        client_id = None
+
+        def reveal(self):
+            return "pk_test_not_a_real_key"
+
+    originals = (m.get_billing_usage, m.get_sent_email_campaigns, m.collect_recipients)
+    m.get_billing_usage = lambda session, api_key: response
+    m.get_sent_email_campaigns = lambda *a, **k: []
+    m.collect_recipients = lambda *a, **k: ({}, [])
+    try:
+        payload = m.process_client(FakeRecord())
+    finally:
+        m.get_billing_usage, m.get_sent_email_campaigns, m.collect_recipients = originals
+
+    other = payload.get("other_usage") or {}
+    check("client succeeded", payload["success"], True)
+    check("hub kept in other_usage", other.get("customer_hub_active_profiles"),
+          {"used": 6405, "limit": 250, "usage_percent": 2562.0, "unit": "profiles"})
+    check("k social kept in other_usage", other.get("k_social_active_profiles"),
+          {"used": 6405, "limit": 250, "usage_percent": 2562.0, "unit": "profiles"})
+    check("payload should_remind false", payload["should_remind"], False)
+    check("payload reasons empty", payload["reasons"], [])
+    check("payload alert_types empty", payload["alert_types"], [])
+    check("ai credits still in payload", (payload["ai_used"], payload["ai_usage_percent"]),
+          (500, 500.0))
+    check("reviews still in payload",
+          (payload["reviews_used"], payload["reviews_usage_percent"]), (500, 500.0))
+    check("unknown metric kept in other_usage",
+          other.get("future_metric_klaviyo_adds", {}).get("usage_percent"), 200.0)
 
 
 def test_average():
@@ -368,7 +491,8 @@ def main():
 
     tmpdir = tempfile.mkdtemp(prefix="klaviyo-test-")
     try:
-        for test in (test_dates, test_usage, test_reminder, test_average,
+        for test in (test_dates, test_usage, test_reminder, test_excluded_metrics,
+                     test_excluded_metrics_preserved, test_average,
                      test_dedupe, test_errors, test_security,
                      test_optional_webhook, test_summary_rendering):
             test()

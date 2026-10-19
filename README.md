@@ -427,11 +427,13 @@ Discord's webhook rate limit, and retries 3 times.
 `should_remind` is true when **any** of these hold:
 
 1. `days_until_billing <= REMINDER_DAYS`
-2. **any** metric is over its limit (overage is always billable)
-3. an **important** metric is at or above `HIGH_USAGE_PERCENT`
+2. a **core** metric is over its limit
+3. a **core** metric is at or above `HIGH_USAGE_PERCENT`
 
-Important metrics: profiles, email, SMS. AI credits and reviews are reported and
-trigger on over-limit, but their high-usage alone does not flag an account.
+Core metrics (`ALERTABLE_USAGE_METRICS`): profiles, email, SMS. Every other
+metric - AI credits, reviews, Customer Hub, K Social, and anything Klaviyo adds
+later - is still reported (in its own field or `other_usage`) but never flags
+an account.
 
 The script only *identifies* accounts to review. It never decides a downgrade or
 a savings amount — that is the human's call.
