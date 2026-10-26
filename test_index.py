@@ -91,7 +91,7 @@ def test_usage():
     metrics = parsed["metrics"]
 
     check("percent computed", metrics["active_profiles"]["percent"], 90.0)
-    check("high usage detected", metrics["active_profiles"]["high_usage"], True)
+    check("90% is below the 95% alert threshold", metrics["active_profiles"]["high_usage"], False)
     check("null limit -> percent None", metrics["sms_credits"]["percent"], None)
     check("null limit is not over limit", metrics["sms_credits"]["over_limit"], False)
     check("over limit detected", metrics["email_sends"]["over_limit"], True)
@@ -106,111 +106,102 @@ def test_usage():
     check("garbage number -> None", m._safe_number("abc"), None)
 
 
-def test_reminder():
-    section("Reminder logic")
-    quiet = {"active_profiles": {"label": "Profiles", "important": True, "used": 1,
-                                 "limit": 100, "percent": 1.0, "over_limit": False,
-                                 "high_usage": False}}
-    check("quiet + far from billing -> no remind", m.build_reminder(quiet, 10)[0], False)
-    check("quiet + 3 days -> remind", m.build_reminder(quiet, 3)[0], True)
-    check("3 days reason", m.build_reminder(quiet, 3)[1], ["Billing period ends in 3 days"])
-    check("1 day is singular", m.build_reminder(quiet, 1)[1], ["Billing period ends in 1 day"])
-    check("0 days -> today", m.build_reminder(quiet, 0)[1], ["Billing period ends today"])
-    check("expired", m.build_reminder(quiet, -2)[1], ["Billing period ended 2 days ago"])
-    check("period alert type", m.build_reminder(quiet, 2)[2], ["billing_period_ending"])
-
-    high = {"sms_credits": {"label": "SMS", "important": True, "used": 95, "limit": 100,
-                            "percent": 95.0, "over_limit": False, "high_usage": True}}
-    check("important high usage -> remind", m.build_reminder(high, 30)[0], True)
-    check("high usage alert type", m.build_reminder(high, 30)[2], ["high_usage:sms_credits"])
-
-    minor = {"ai_credits": {"label": "AI credits", "important": False, "used": 95,
-                            "limit": 100, "percent": 95.0, "over_limit": False,
-                            "high_usage": True}}
-    check("unimportant high usage -> no remind", m.build_reminder(minor, 30)[0], False)
-
-    over = {"ai_credits": {"label": "AI credits", "important": False, "used": 150,
-                           "limit": 100, "percent": 150.0, "over_limit": True,
-                           "high_usage": True}}
-    check("non-core over limit -> no remind", m.build_reminder(over, 30), (False, [], []))
-
-
-def _billing_item(metric_id, used, limit, unit="profiles"):
+def _billing_item(metric_id, used, limit, unit="profiles",
+                  start="2026-10-01T00:00:00Z", end="2026-11-01T00:00:00Z"):
     return {"id": metric_id, "attributes": {
         "usage_used": used, "usage_max": limit, "unit": unit,
-        "period_start": "2026-10-01T00:00:00Z", "period_end": "2026-11-01T00:00:00Z"}}
+        "period_start": start, "period_end": end}}
+
+
+def _remind(items):
+    return m.build_reminder(m.parse_billing_usage({"data": items})["metrics"])
+
+
+# Core metrics comfortably below 95%.
+SAFE = [_billing_item("active_profiles", 3250, 6500),
+        _billing_item("email_sends", 2000, 10000, "messages"),
+        _billing_item("sms_credits", 10, 100, "USD")]
+
+
+def test_reminder():
+    section("Reminder logic: core usage >= 95% only")
+    check("threshold is 95%", m.USAGE_ALERT_PERCENT, 95.0)
+
+    check("1. profiles 94.99% -> no alert",
+          _remind([_billing_item("active_profiles", 9499, 10000)]), (False, [], []))
+    check("   profiles 94.996% does not round up into an alert",
+          _remind([_billing_item("active_profiles", 94996, 100000)])[0], False)
+    check("2. profiles 95.00% -> alert",
+          _remind([_billing_item("active_profiles", 9500, 10000)]),
+          (True, ["Profiles usage is at 95.0%"], ["usage:active_profiles"]))
+    check("   profiles 95.2% reason",
+          _remind([_billing_item("active_profiles", 9520, 10000)]),
+          (True, ["Profiles usage is at 95.2%"], ["usage:active_profiles"]))
+    check("3. profiles 98% -> alert",
+          _remind([_billing_item("active_profiles", 6370, 6500)] + SAFE[1:]),
+          (True, ["Profiles usage is at 98.0%"], ["usage:active_profiles"]))
+    check("   profiles 105% -> same alert type, no separate over-limit",
+          _remind([_billing_item("active_profiles", 6825, 6500)] + SAFE[1:]),
+          (True, ["Profiles usage is at 105.0%"], ["usage:active_profiles"]))
+    check("   email 95% -> alert",
+          _remind([SAFE[0], _billing_item("email_sends", 9500, 10000, "messages"), SAFE[2]]),
+          (True, ["Email usage is at 95.0%"], ["usage:email_sends"]))
+    check("   sms 96% -> alert",
+          _remind(SAFE[:2] + [_billing_item("sms_credits", 96, 100, "USD")]),
+          (True, ["SMS usage is at 96.0%"], ["usage:sms_credits"]))
+    check("   all three -> three independent alert types",
+          _remind([_billing_item("active_profiles", 96, 100),
+                   _billing_item("email_sends", 97, 100, "messages"),
+                   _billing_item("sms_credits", 98, 100, "USD")])[2],
+          ["usage:active_profiles", "usage:email_sends", "usage:sms_credits"])
+    check("   core zero allowance with usage -> alert",
+          _remind([_billing_item("sms_credits", 5, 0, "USD")]),
+          (True, ["SMS usage is over its zero allowance"], ["usage:sms_credits"]))
+    check("   unlimited core metric -> no alert",
+          _remind([_billing_item("sms_credits", 5000, None, "USD")]), (False, [], []))
+    check("example 1: 78% / 25% / 10% -> quiet",
+          _remind([_billing_item("active_profiles", 78, 100),
+                   _billing_item("email_sends", 25, 100, "messages"),
+                   _billing_item("sms_credits", 10, 100, "USD")]), (False, [], []))
+    check("build_reminder no longer takes days remaining",
+          m.build_reminder.__code__.co_argcount, 1)
+    check("REMINDER_DAYS countdown setting is gone", hasattr(m, "REMINDER_DAYS"), False)
 
 
 def test_excluded_metrics():
-    section("Only Profiles / Email / SMS raise usage alerts")
+    section("15. Only Profiles / Email / SMS raise usage alerts")
     # 6405 / 250 = 2562% - the real-world numbers that caused noisy alerts.
     hub = _billing_item("customer_hub_active_profiles", 6405, 250)
     social = _billing_item("k_social_active_profiles", 6405, 250)
-    safe = [_billing_item("active_profiles", 3250, 6500),
-            _billing_item("email_sends", 2000, 10000, "messages"),
-            _billing_item("sms_credits", 10, 100, "USD")]
-
-    def remind(items, days=20):
-        return m.build_reminder(m.parse_billing_usage({"data": items})["metrics"], days)
 
     check("allowlist is exactly the core metrics", m.ALERTABLE_USAGE_METRICS,
           frozenset({"active_profiles", "email_sends", "sms_credits"}))
-
-    check("profiles 98% -> high_usage",
-          remind([_billing_item("active_profiles", 6370, 6500)] + safe[1:]),
-          (True, ["Profiles usage is at 98.0%"], ["high_usage:active_profiles"]))
-    check("email 95% -> high_usage",
-          remind([safe[0], _billing_item("email_sends", 9500, 10000, "messages"), safe[2]]),
-          (True, ["Email usage is at 95.0%"], ["high_usage:email_sends"]))
-    check("sms 96% -> high_usage",
-          remind(safe[:2] + [_billing_item("sms_credits", 96, 100, "USD")]),
-          (True, ["SMS usage is at 96.0%"], ["high_usage:sms_credits"]))
-    check("profiles 105% -> over_limit",
-          remind([_billing_item("active_profiles", 6825, 6500)] + safe[1:]),
-          (True, ["Profiles usage is over its limit (105.0%)"],
-           ["over_limit:active_profiles"]))
-    check("ai credits 500% -> no remind",
-          remind(safe + [_billing_item("ai_credits", 500, 100, "credits")]), (False, [], []))
-    check("reviews 500% -> no remind",
-          remind(safe + [_billing_item("reviews_orders", 500, 100, "orders")]), (False, [], []))
-    check("hub / k social 20,000% -> no remind",
-          remind(safe + [_billing_item("customer_hub_active_profiles", 50000, 250),
-                         _billing_item("k_social_active_profiles", 50000, 250)]),
+    check("ai credits 500% -> no alert",
+          _remind(SAFE + [_billing_item("ai_credits", 500, 100, "credits")]), (False, [], []))
+    check("reviews 500% -> no alert",
+          _remind(SAFE + [_billing_item("reviews_orders", 500, 100, "orders")]), (False, [], []))
+    check("hub / k social 20,000% -> no alert",
+          _remind(SAFE + [_billing_item("customer_hub_active_profiles", 50000, 250),
+                          _billing_item("k_social_active_profiles", 50000, 250)]),
           (False, [], []))
-    check("helpdesk / ai resolutions over -> no remind",
-          remind(safe + [_billing_item("helpdesk_conversations", 900, 800, "conversations"),
-                         _billing_item("ai_resolutions", 900, 750, "resolutions")]),
+    check("helpdesk / ai resolutions over -> no alert",
+          _remind(SAFE + [_billing_item("helpdesk_conversations", 900, 800, "conversations"),
+                          _billing_item("ai_resolutions", 900, 750, "resolutions")]),
           (False, [], []))
-    check("unknown future metric over limit -> no remind",
-          remind(safe + [_billing_item("future_metric_klaviyo_adds", 10, 0, "things")]),
+    check("unknown future metric over limit -> no alert",
+          _remind(SAFE + [_billing_item("future_metric_klaviyo_adds", 10, 0, "things")]),
           (False, [], []))
-    check("billing ending, usage normal -> remind",
-          remind(safe, days=m.REMINDER_DAYS),
-          (True, ["Billing period ends in {} days".format(m.REMINDER_DAYS)],
-           ["billing_period_ending"]))
     check("2562% is computed for hub",
           m.parse_billing_usage({"data": [hub]})["metrics"]["customer_hub_active_profiles"]["percent"],
           2562.0)
-
-    check("main profiles 98.95% -> remind",
-          remind([_billing_item("active_profiles", 6432, 6500), hub, social]),
-          (True, ["Profiles usage is at 98.95%"], ["high_usage:active_profiles"]))
-    check("customer hub 2562% alone -> no remind", remind([hub]), (False, [], []))
-    check("k social 2562% alone -> no remind", remind([social]), (False, [], []))
-    check("both optional high, main safe -> no remind",
-          remind(safe + [hub, social]), (False, [], []))
+    check("main profiles 98.95% alongside hub -> profiles only",
+          _remind([_billing_item("active_profiles", 6432, 6500), hub, social]),
+          (True, ["Profiles usage is at 98.95%"], ["usage:active_profiles"]))
+    check("customer hub 2562% alone -> no alert", _remind([hub]), (False, [], []))
+    check("k social 2562% alone -> no alert", _remind([social]), (False, [], []))
     check("sms 95% + optional high -> only sms",
-          remind([_billing_item("active_profiles", 3250, 6500),
-                  _billing_item("email_sends", 2000, 10000, "messages"),
-                  _billing_item("sms_credits", 95, 100, "USD"), hub, social]),
-          (True, ["SMS usage is at 95.0%"], ["high_usage:sms_credits"]))
-    check("main profiles over 100% -> remind",
-          remind([_billing_item("active_profiles", 7000, 6500), hub, social]),
-          (True, ["Profiles usage is over its limit (107.69%)"],
-           ["over_limit:active_profiles"]))
-    check("billing ending + optional high -> period only",
-          remind(safe + [hub, social], days=2),
-          (True, ["Billing period ends in 2 days"], ["billing_period_ending"]))
+          _remind(SAFE[:2] + [_billing_item("sms_credits", 95, 100, "USD"), hub, social]),
+          (True, ["SMS usage is at 95.0%"], ["usage:sms_credits"]))
 
 
 def test_excluded_metrics_preserved():
@@ -271,51 +262,364 @@ def test_average():
     check("all estimates failed -> None", avg([None, None]), None)
 
 
+def _usage_payload(types, period_end="2026-11-21T00:00:00+00:00", name="FortCore",
+                   reasons=None):
+    reasons = reasons or ["{} reason".format(t) for t in types]
+    return {"client_name": name, "success": True, "should_remind": bool(types),
+            "billing_period_end": period_end, "alert_types": list(types),
+            "reasons": list(reasons),
+            "usage_alerts": [{"alert_type": t, "reason": r} for t, r in zip(types, reasons)]}
+
+
 def test_dedupe():
-    section("Duplicate alert suppression")
-    def key(**kw):
-        p = dict(client_name="Acme", success=True, should_remind=True,
-                 billing_period_end="2026-09-12T21:07:00+00:00",
-                 alert_types=["high_usage:sms_credits"])
-        p.update(kw)
-        return m.alert_identity(p)[1]
+    section("Duplicate suppression: one alert per metric per billing period")
 
-    base = key()
-    check("stable across runs", key(), base)
-    check("escalation makes a new key", key(alert_types=["over_limit:sms_credits"]) != base, True)
-    check("new billing period makes a new key",
-          key(billing_period_end="2026-10-12T21:07:00+00:00") != base, True)
-    check("other client makes a new key", key(client_name="Other") != base, True)
-    check("alert type order does not matter",
-          key(alert_types=["a", "b"]), key(alert_types=["b", "a"]))
-    check("quiet account has no alert key",
-          m.alert_identity({"client_name": "A", "success": True, "should_remind": False})[1], None)
-    check("failure gets its own key",
-          m.alert_identity({"client_name": "A", "success": False, "error_type": "auth"})[0],
-          ["client_failed:auth"])
+    def keys(payload):
+        return dict(m.alert_identity(payload))
 
-    now = m.now_utc()
-    payloads = [
-        {"client_name": "Acme", "success": True, "should_remind": True,
-         "billing_period_end": "2026-09-12T21:07:00+00:00",
-         "alert_types": ["high_usage:sms_credits"]},
-    ]
+    base = keys(_usage_payload(["usage:active_profiles"]))["usage:active_profiles"]
+    check("key is stable across runs",
+          keys(_usage_payload(["usage:active_profiles"]))["usage:active_profiles"], base)
+    check("key ignores the percentage / reason text",
+          keys(_usage_payload(["usage:active_profiles"],
+                              reasons=["Profiles usage is at 105.0%"]))["usage:active_profiles"],
+          base)
+    check("key = client + period end + metric",
+          base, m._alert_key("FortCore", "2026-11-21", "usage:active_profiles"))
+    check("key ignores period-end timestamp formatting",
+          keys(_usage_payload(["usage:active_profiles"],
+                              period_end="2026-11-21T00:00:00.000Z"))["usage:active_profiles"],
+          base)
+    check("new billing period -> new key",
+          keys(_usage_payload(["usage:active_profiles"],
+                              period_end="2026-12-21T00:00:00+00:00"))["usage:active_profiles"]
+          != base, True)
+    check("other client -> new key",
+          keys(_usage_payload(["usage:active_profiles"], name="Other"))["usage:active_profiles"]
+          != base, True)
+    both = keys(_usage_payload(["usage:active_profiles", "usage:sms_credits"]))
+    check("each metric has its own key",
+          (both["usage:active_profiles"], both["usage:sms_credits"] != base), (base, True))
+    check("quiet account has no alert identity",
+          m.alert_identity({"client_name": "A", "success": True, "should_remind": False}), [])
+    check("failure keeps its existing key format",
+          m.alert_identity({"client_name": "A", "success": False, "error_type": "auth"}),
+          [("client_failed:auth", m._alert_key("A", "failure", "client_failed:auth"))])
+
+    # --- the daily sequence from the spec, against one state ---------------
     state = {}
-    m.mark_duplicates(payloads, state, force=False)
-    check("first sighting is not a duplicate", payloads[0]["suppressed_duplicate"], False)
 
-    m.record_alert(state, payloads[0])
-    check("state remembers the alert", len(state), 1)
+    def run(types, reasons, period_end="2026-11-21T00:00:00+00:00", force=False):
+        payload = _usage_payload(types, period_end=period_end, reasons=reasons)
+        m.mark_duplicates([payload], state, force=force)
+        return payload
 
-    m.mark_duplicates(payloads, state, force=False)
-    check("second sighting IS a duplicate", payloads[0]["suppressed_duplicate"], True)
+    day2 = run(["usage:active_profiles"], ["Profiles usage is at 95.1%"])
+    check("example 2: first 95.1% -> should_remind", day2["should_remind"], True)
+    check("example 2: reason", day2["reasons"], ["Profiles usage is at 95.1%"])
+    check("example 2: not a duplicate", day2["suppressed_duplicate"], False)
+    m.record_alert(state, day2)
+    check("18. delivery records exactly one key", list(state), [base])
 
-    m.mark_duplicates(payloads, state, force=True)
-    check("--force overrides", payloads[0]["suppressed_duplicate"], False)
+    day3 = run(["usage:active_profiles"], ["Profiles usage is at 97.8%"])
+    check("4. next day 97.8% -> should_remind false", day3["should_remind"], False)
+    check("4. ...reasons empty", day3["reasons"], [])
+    check("4. ...suppressed", day3["suppressed_duplicate"], True)
+    check("4. ...lists what already alerted",
+          [a["alert_type"] for a in day3["already_alerted"]], ["usage:active_profiles"])
+    check("4. ...says when", day3["previously_alerted_at"], state[base])
 
-    state_old = {list(state)[0]: (now - timedelta(days=30)).isoformat()}
-    m.mark_duplicates(payloads, state_old, force=False)
-    check("re-alerts after cooldown", payloads[0]["suppressed_duplicate"], False)
+    day5 = run(["usage:active_profiles"], ["Profiles usage is at 105.0%"])
+    check("5. 105% after 95% alert -> still suppressed",
+          (day5["should_remind"], day5["suppressed_duplicate"]), (False, True))
+
+    old = dict(state)
+    state[base] = (m.now_utc() - timedelta(days=60)).isoformat()
+    check("usage alerts never re-fire on a cooldown",
+          run(["usage:active_profiles"], ["Profiles usage is at 110%"])["should_remind"], False)
+    state.clear()
+    state.update(old)
+
+    sms = run(["usage:active_profiles", "usage:sms_credits"],
+              ["Profiles usage is at 99.0%", "SMS usage is at 96.0%"])
+    check("6. profiles alerted, SMS reaches 96% -> alert", sms["should_remind"], True)
+    check("6. ...only the SMS reason is sent", sms["reasons"], ["SMS usage is at 96.0%"])
+    check("6. ...only the SMS type is sent", sms["alert_types"], ["usage:sms_credits"])
+    check("6. ...profiles not resent",
+          [a["alert_type"] for a in sms["already_alerted"]], ["usage:active_profiles"])
+    check("6. ...not marked as a duplicate", sms["suppressed_duplicate"], False)
+    m.record_alert(state, sms)
+    check("6. ...recording adds only the SMS key", len(state), 2)
+
+    for pct in ("96.2", "96.9", "97.5"):
+        again = run(["usage:active_profiles", "usage:sms_credits"],
+                    ["Profiles usage is at 99.0%", "SMS usage is at {}%".format(pct)])
+        check("7. SMS {}% after SMS alert -> no new alert".format(pct),
+              again["should_remind"], False)
+
+    email = run(["usage:active_profiles", "usage:email_sends", "usage:sms_credits"],
+                ["Profiles usage is at 99.0%", "Email usage is at 95.5%", "SMS usage is at 97.0%"])
+    check("8. email alerts independently",
+          (email["should_remind"], email["alert_types"]), (True, ["usage:email_sends"]))
+    m.record_alert(state, email)
+    check("8. three alerts max for this period", len(state), 3)
+    check("8. all three alerted -> silent",
+          run(["usage:active_profiles", "usage:email_sends", "usage:sms_credits"],
+              ["p", "e", "s"])["should_remind"], False)
+
+    nxt = run(["usage:active_profiles"], ["Profiles usage is at 95.0%"],
+              period_end="2026-12-21T00:00:00+00:00")
+    check("9. new billing period -> profiles may alert again",
+          (nxt["should_remind"], nxt["suppressed_duplicate"]), (True, False))
+
+    forced = run(["usage:active_profiles"], ["Profiles usage is at 99.0%"], force=True)
+    check("--force overrides", forced["should_remind"], True)
+
+    check("mark_duplicates is repeatable (candidates untouched)",
+          len(day3["usage_alerts"]), 1)
+    m.mark_duplicates([day3], {}, force=False)
+    check("...re-evaluating with empty history re-qualifies", day3["should_remind"], True)
+
+    # --- client failures keep cooldown suppression ------------------------
+    fail = {"client_name": "Broken", "success": False, "error_type": "auth"}
+    fstate = {}
+    m.mark_duplicates([fail], fstate, force=False)
+    check("16. failure alerts", fail["suppressed_duplicate"], False)
+    m.record_alert(fstate, fail)
+    m.mark_duplicates([fail], fstate, force=False)
+    check("identical failure next day suppressed", fail["suppressed_duplicate"], True)
+    old_fail = {k: (m.now_utc() - timedelta(days=30)).isoformat() for k in fstate}
+    m.mark_duplicates([fail], old_fail, force=False)
+    check("failure re-alerts after cooldown", fail["suppressed_duplicate"], False)
+
+
+class _FakeN8n:
+    """Local stand-in for the n8n webhook that records every POST body."""
+
+    def __init__(self):
+        received = self.received = []
+        self.status = 200
+        owner = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                received.append(body.decode("utf-8"))
+                self.send_response(owner.status)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        self._server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+        self.url = "http://127.0.0.1:{}/webhook/SECRET-TOKEN".format(self._server.server_port)
+
+    def take(self):
+        bodies = [json.loads(b) for b in self.received]
+        del self.received[:]
+        return bodies
+
+    def close(self):
+        self._server.shutdown()
+
+
+SECRET_KEY = "pk_TESTONLY_never_log_this_0123456789"
+
+
+def test_daily_runs(tmpdir):
+    section("End to end: daily main() runs, n8n delivery and alert history")
+    import io
+    import contextlib
+    import logging
+
+    n8n = _FakeN8n()
+    state_file = os.path.join(tmpdir, "alert_state.json")
+    accounts = {}   # client name -> billing-usage response, or an exception
+
+    class FakeRecord:
+        client_id = None
+
+        def __init__(self, name):
+            self.client_name = name
+
+        def reveal(self):
+            return SECRET_KEY
+
+    def fake_billing(session, api_key):
+        assert api_key == SECRET_KEY
+        account = accounts[current["name"]]
+        if isinstance(account, Exception):
+            raise account
+        return account
+
+    current = {}
+    real_process = m.process_client
+
+    def process(record):
+        current["name"] = record.client_name
+        return real_process(record)
+
+    # Klaviyo reports a fixed period boundary; it must not drift between runs.
+    period_now = m.now_utc().replace(microsecond=0)
+    period = ((period_now - timedelta(days=10)).isoformat(),
+              (period_now + timedelta(days=20)).isoformat())
+
+    def account(profiles=30, email=20, sms=10, start=None, end=None, extra=()):
+        start = start or period[0]
+        end = end or period[1]
+        items = [_billing_item("active_profiles", profiles, 100, start=start, end=end),
+                 _billing_item("email_sends", email, 100, "messages", start=start, end=end),
+                 _billing_item("sms_credits", sms, 100, "USD", start=start, end=end)]
+        return {"data": items + [_billing_item(i, u, l, start=start, end=end)
+                                 for i, u, l in extra]}
+
+    logs = io.StringIO()
+    log_handler = logging.StreamHandler(logs)
+
+    def run(*flags):
+        """One daily run. Returns (POST bodies, stdout)."""
+        sys.argv = ["index.py", "--state-file", state_file] + list(flags)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            m.main()
+        return n8n.take(), out.getvalue()
+
+    originals = (m.load_clients, m.process_client, m.get_billing_usage,
+                 m.get_sent_email_campaigns, m.collect_recipients, m.N8N_WEBHOOK_URL,
+                 sys.argv, os.environ.pop("DATABASE_URL", None))
+    m.load_clients = lambda: [FakeRecord(name) for name in sorted(accounts)]
+    m.process_client = lambda record: process(record)
+    m.get_billing_usage = fake_billing
+    m.get_sent_email_campaigns = lambda *a, **k: []
+    m.collect_recipients = lambda *a, **k: ({}, [])
+    m.N8N_WEBHOOK_URL = n8n.url
+    m.MAX_WORKERS = 1   # `current` is shared; keep clients sequential
+    m.logger.addHandler(log_handler)
+    try:
+        # Example 1 / 14: normal client.
+        accounts["FortCore"] = account(profiles=78, email=25, sms=10)
+        sent, _ = run()
+        check("14. normal client -> nothing POSTed to n8n", sent, [])
+
+        # 1: 94.99% (day 1).
+        accounts["FortCore"] = account(profiles=94.99)
+        sent, _ = run()
+        check("1. profiles 94.99% -> nothing POSTed", sent, [])
+
+        # 10-13: billing countdown with normal usage.
+        for label, end in [
+            ("10. billing 3 days remaining", timedelta(days=3, hours=2)),
+            ("11. billing 1 day remaining", timedelta(days=1, hours=2)),
+            ("12. billing ends today", timedelta(hours=6)),
+        ]:
+            accounts["FortCore"] = account(end=(m.now_utc() + end).isoformat())
+            sent, _ = run()
+            check(label + " -> nothing POSTed", sent, [])
+        accounts["FortCore"] = account(start=(m.now_utc() - timedelta(hours=1)).isoformat(),
+                                       end=(m.now_utc() + timedelta(days=30)).isoformat())
+        sent, _ = run()
+        check("13. new billing period alone -> nothing POSTed", sent, [])
+
+        # 15: excluded metrics wildly over, core fine.
+        accounts["FortCore"] = account(extra=[
+            ("customer_hub_active_profiles", 6405, 250), ("k_social_active_profiles", 6405, 250),
+            ("ai_credits", 500, 100), ("reviews_orders", 500, 100),
+            ("helpdesk_conversations", 900, 800), ("ai_resolutions", 900, 750),
+            ("future_metric_klaviyo_adds", 10, 0)])
+        sent, _ = run()
+        check("15. hub/K social/AI/reviews/unknown over -> nothing POSTed", sent, [])
+        check("15. nothing recorded in alert history",
+              m.load_alert_state(state_file), {})
+
+        # 17: profiles hits 95.1% but n8n is down.
+        accounts["FortCore"] = account(profiles=95.1)
+        n8n.status = 500
+        sent, _ = run()
+        check("17. failed delivery was attempted", len(sent) >= 1, True)
+        check("17. failed delivery is NOT recorded", m.load_alert_state(state_file), {})
+
+        # Dry run: shows the qualifying client, sends nothing, writes nothing.
+        n8n.status = 200
+        before = open(state_file).read() if os.path.exists(state_file) else None
+        sent, out = run("--dry-run")
+        after = open(state_file).read() if os.path.exists(state_file) else None
+        check("dry run POSTs nothing", sent, [])
+        check("dry run leaves alert history untouched", after, before)
+        check("dry run shows the qualifying alert", "Profiles usage is at 95.1%" in out, True)
+
+        # 2 / 18: retried next run, n8n back up.
+        sent, _ = run()
+        check("17. retried on the next run -> one POST", len(sent), 1)
+        check("2. first 95.1% alert reason",
+              sent[0]["reasons"] if sent else None, ["Profiles usage is at 95.1%"])
+        check("2. alert payload should_remind", sent[0]["should_remind"] if sent else None, True)
+        check("18. successful delivery recorded", len(m.load_alert_state(state_file)), 1)
+        first_alert = sent[0] if sent else {}
+
+        # 4 / 5: following days.
+        for pct in (96, 99, 103):
+            accounts["FortCore"] = account(profiles=pct)
+            sent, out = run()
+            check("4/5. profiles {}% after alert -> nothing POSTed".format(pct), sent, [])
+        check("5. summary shows it already alerted",
+              "Already alerted" in out and "usage:active_profiles" in out, True)
+
+        # 6 / 7: SMS reaches 96%, then drifts.
+        accounts["FortCore"] = account(profiles=103, sms=96)
+        sent, _ = run()
+        check("6. SMS 96% -> exactly one POST", len(sent), 1)
+        check("6. ...carrying only the SMS reason",
+              sent[0]["reasons"] if sent else None, ["SMS usage is at 96.0%"])
+        for sms in (96.4, 97.2):
+            accounts["FortCore"] = account(profiles=104, sms=sms)
+            sent, _ = run()
+            check("7. SMS {}% after SMS alert -> nothing POSTed".format(sms), sent, [])
+
+        # 8: Email.
+        accounts["FortCore"] = account(profiles=104, sms=97, email=95)
+        sent, _ = run()
+        check("8. Email 95% -> one POST with only Email",
+              [s["alert_types"] for s in sent], [["usage:email_sends"]])
+        check("8. three alerts recorded for this period",
+              len(m.load_alert_state(state_file)), 3)
+
+        # 9: next billing period.
+        accounts["FortCore"] = account(profiles=95, start=m.now_utc().isoformat(),
+                                       end=(m.now_utc() + timedelta(days=31)).isoformat())
+        sent, _ = run()
+        check("9. new billing period -> profiles alerts again",
+              [s["alert_types"] for s in sent], [["usage:active_profiles"]])
+
+        # 16: client / API failure still alerts, once.
+        accounts["Broken Co"] = m.KlaviyoError("GET billing-usage -> 401 bad key", 401, "auth")
+        sent, _ = run()
+        failures = [s for s in sent if s["client_name"] == "Broken Co"]
+        check("16. invalid API key -> failure POSTed",
+              [(s["success"], s["error_type"]) for s in failures], [(False, "auth")])
+        check("16. ...and FortCore is not re-sent",
+              [s["client_name"] for s in sent], ["Broken Co"])
+        sent, _ = run()
+        check("16. same failure next day is suppressed", sent, [])
+
+        # 19: raw usage data still in the delivered payload.
+        check("19. raw usage fields still delivered",
+              (first_alert.get("active_profiles"), first_alert.get("profile_limit"),
+               first_alert.get("email_used"), first_alert.get("sms_used"),
+               "days_until_billing" in first_alert, "billing_period_start" in first_alert),
+              (95.1, 100, 20, 10, True, True))
+
+        # 20: no secrets anywhere.
+        everything = json.dumps(first_alert) + logs.getvalue()
+        check("20. API key never in a payload or log line", SECRET_KEY in everything, False)
+        check("20. webhook token never in a log line", "SECRET-TOKEN" in logs.getvalue(), False)
+    finally:
+        (m.load_clients, m.process_client, m.get_billing_usage, m.get_sent_email_campaigns,
+         m.collect_recipients, m.N8N_WEBHOOK_URL, sys.argv, db_url) = originals
+        if db_url is not None:
+            os.environ["DATABASE_URL"] = db_url
+        m.logger.removeHandler(log_handler)
+        n8n.close()
 
 
 def test_errors():
@@ -496,6 +800,7 @@ def main():
                      test_dedupe, test_errors, test_security,
                      test_optional_webhook, test_summary_rendering):
             test()
+        test_daily_runs(tmpdir)
         test_dotenv(tmpdir)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

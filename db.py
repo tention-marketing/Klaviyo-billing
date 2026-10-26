@@ -217,6 +217,7 @@ SCHEMA: Sequence[Tuple[str, str]] = (
 )
 
 
+
 def migrate(url: Optional[str] = None) -> List[Tuple[str, str]]:
     """
     Apply the schema. Idempotent - every statement is CREATE ... IF NOT EXISTS
@@ -364,10 +365,17 @@ def record_alerts(
 
 
 def prune_alert_history(days: int, url: Optional[str] = None) -> int:
+    """
+    Drop old alerts, but never one whose billing period is still running:
+    that row is what stops a usage alert repeating within the period, and a
+    period (e.g. an annual plan) can outlast the retention window.
+    """
     with connection(url) as conn:
         row = conn.execute(
             "WITH gone AS (DELETE FROM klaviyo_alert_history "
-            "  WHERE alerted_at < now() - make_interval(days => %s) RETURNING 1) "
+            "  WHERE alerted_at < now() - make_interval(days => %s) "
+            "    AND (billing_period_end IS NULL OR billing_period_end < now()) "
+            "  RETURNING 1) "
             "SELECT count(*) AS n FROM gone",
             (int(days),),
         ).fetchone()

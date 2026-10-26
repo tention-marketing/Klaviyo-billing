@@ -286,12 +286,18 @@ def test_alert_history():
     store._db = database
 
     def payload(period_end="2026-09-12T21:07:00+00:00",
-                types=("high_usage:sms_credits",), name="Acme"):
+                types=("usage:sms_credits",), name="Acme"):
         return {
             "client_name": name, "client_id": None, "success": True,
             "should_remind": True, "billing_period_end": period_end,
             "alert_types": list(types),
+            "usage_alerts": [{"alert_type": t, "reason": t} for t in types],
         }
+
+    def evaluate(p):
+        batch = [p]
+        m.mark_duplicates(batch, store.load(m.assign_alert_identity(batch)), force=False)
+        return p
 
     original_url = os.environ.get("DATABASE_URL")
     os.environ["DATABASE_URL"] = TEST_URL
@@ -313,52 +319,73 @@ def test_alert_history():
         check("TEST 13: row persisted in Postgres",
               row["client_name"], "Acme")
         check("TEST 13: alert_types stored",
-              list(row["alert_types"]), ["high_usage:sms_credits"])
+              list(row["alert_types"]), ["usage:sms_credits"])
         check("TEST 13: billing period stored",
               row["billing_period_end"].isoformat(), "2026-09-12T21:07:00+00:00")
 
-        second = [payload()]
-        keys = m.assign_alert_identity(second)
-        state2 = store.load(keys)
-        m.mark_duplicates(second, state2, force=False)
-        check("TEST 14: identical alert suppressed",
-              second[0]["suppressed_duplicate"], True)
+        second = evaluate(payload())
+        check("TEST 14: same metric, same period suppressed",
+              (second["should_remind"], second["suppressed_duplicate"]), (False, True))
         check("TEST 14: reports when it last fired",
-              bool(second[0]["previously_alerted_at"]), True)
+              bool(second["previously_alerted_at"]), True)
 
-        newer = [payload(period_end="2026-10-12T21:07:00+00:00")]
-        keys = m.assign_alert_identity(newer)
-        m.mark_duplicates(newer, store.load(keys), force=False)
+        newer = evaluate(payload(period_end="2026-10-12T21:07:00+00:00"))
         check("TEST 15: new billing period alerts again",
-              newer[0]["suppressed_duplicate"], False)
+              (newer["should_remind"], newer["suppressed_duplicate"]), (True, False))
         check("TEST 15: and gets a different key",
-              newer[0]["alert_key"] != second[0]["alert_key"], True)
+              newer["alert_keys"] != first[0]["alert_keys"], True)
 
-        escalated = [payload(types=("over_limit:sms_credits",))]
-        keys = m.assign_alert_identity(escalated)
-        m.mark_duplicates(escalated, store.load(keys), force=False)
-        check("TEST 16: high usage -> over limit alerts again",
-              escalated[0]["suppressed_duplicate"], False)
+        both = evaluate(payload(types=("usage:active_profiles", "usage:sms_credits")))
+        check("TEST 16: another metric alerts, alerted one is not resent",
+              both["alert_types"], ["usage:active_profiles"])
+        st = store.load(m.assign_alert_identity([both]))
+        m.record_alert(st, both)
+        store.persist([both], st)
+        with database.connection(TEST_URL) as conn:
+            rows = conn.execute(
+                "SELECT alert_types FROM klaviyo_alert_history "
+                "WHERE billing_period_end = '2026-09-12T21:07:00+00:00' "
+                "ORDER BY alert_types").fetchall()
+        check("TEST 16: one history row per metric",
+              [list(r["alert_types"]) for r in rows],
+              [["usage:active_profiles"], ["usage:sms_credits"]])
 
         forced = [payload()]
-        m.assign_alert_identity(forced)
         m.mark_duplicates(forced, store.load(m.assign_alert_identity(forced)), force=True)
         check("--force overrides suppression",
               forced[0]["suppressed_duplicate"], False)
 
         # Concurrency: the same key recorded twice must not duplicate rows.
         again = [payload()]
+        m.mark_duplicates(again, {}, force=False)
         st = {}
-        m.assign_alert_identity(again)
-        again[0]["suppressed_duplicate"] = False
         m.record_alert(st, again[0])
         store.persist(again, st)
         store.persist(again, st)
         with database.connection(TEST_URL) as conn:
             count = conn.execute(
                 "SELECT count(*) AS n FROM klaviyo_alert_history "
-                "WHERE alert_key = %s", (again[0]["alert_key"],)).fetchone()["n"]
+                "WHERE alert_key = %s", (again[0]["alert_keys"][0],)).fetchone()["n"]
         check("repeat persist upserts, never duplicates", count, 1)
+
+        # Retention must not forget an alert whose billing period is running.
+        with database.connection(TEST_URL) as conn:
+            conn.execute(
+                "UPDATE klaviyo_alert_history SET alerted_at = now() - interval '400 days', "
+                "billing_period_end = now() + interval '30 days'")
+        database.prune_alert_history(90, url=TEST_URL)
+        with database.connection(TEST_URL) as conn:
+            kept = conn.execute(
+                "SELECT count(*) AS n FROM klaviyo_alert_history").fetchone()["n"]
+        check("prune keeps alerts for a still-open billing period", kept > 0, True)
+        with database.connection(TEST_URL) as conn:
+            conn.execute(
+                "UPDATE klaviyo_alert_history SET billing_period_end = now() - interval '1 day'")
+        database.prune_alert_history(90, url=TEST_URL)
+        with database.connection(TEST_URL) as conn:
+            left = conn.execute(
+                "SELECT count(*) AS n FROM klaviyo_alert_history").fetchone()["n"]
+        check("prune drops old alerts once their period ended", left, 0)
 
         quiet = [{"client_name": "Quiet", "success": True, "should_remind": False}]
         keys = m.assign_alert_identity(quiet)

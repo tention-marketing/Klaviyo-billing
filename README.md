@@ -79,7 +79,7 @@ a warning rather than failing the run.
 python3 index.py                      # check everyone, POST to n8n
 python3 index.py --dry-run            # print payloads, contact no webhook
 python3 index.py --client "Steven Denn"   # one client (repeatable)
-python3 index.py --remind-only        # only POST accounts that need review
+python3 index.py --remind-only        # no-op: only new alerts are ever POSTed
 python3 index.py --out results.json   # also write every payload to disk
 python3 index.py --force              # re-send alerts already sent
 python3 index.py --no-dedupe          # disable duplicate suppression
@@ -331,16 +331,15 @@ of `pk_`.
 | `N8N_SEND_MODE` | `per_client` | `per_client` or `batch` |
 | `KLAVIYO_CLIENTS_FILE` | `clients.json` | Client config path |
 | `KLAVIYO_CLIENTS` | – | Inline JSON, overrides the file |
-| `REMINDER_DAYS` | `3` | Flag when the period ends within N days |
-| `HIGH_USAGE_PERCENT` | `90` | Flag when an important metric hits this |
+| `USAGE_ALERT_PERCENT` | `95` | A core metric at or above this alerts once per billing period |
 | `MAX_WORKERS` | `6` | Clients checked in parallel |
 | `MAX_RETRIES` | `4` | Retries for 429/5xx/network |
 | `USE_ESTIMATION_FALLBACK` | `false` | Only enable if keys have `campaigns:write` |
 | `DATABASE_URL` | *(optional)* | Set → encrypted Postgres client store + alert history |
 | `KLAVIYO_MASTER_KEY` | *(required with DB)* | base64 32 bytes; validated at startup |
 | `ALERT_STATE_FILE` | `.alert_state.json` | Local fallback only; unused when `DATABASE_URL` is set |
-| `ALERT_COOLDOWN_HOURS` | `168` | Unchanged alert may repeat after this; `0` = never |
-| `ALERT_STATE_RETENTION_DAYS` | `90` | Prune remembered alerts older than this |
+| `ALERT_COOLDOWN_HOURS` | `168` | Unchanged client *failure* may repeat after this; `0` = never. Usage alerts never repeat within a period |
+| `ALERT_STATE_RETENTION_DAYS` | `90` | Prune remembered alerts older than this (Postgres keeps any whose billing period is still running) |
 | `LOG_LEVEL` | `INFO` | `DEBUG` shows retries |
 
 ## Delivery modes
@@ -368,30 +367,30 @@ anything goes on the wire.
 
 ## Duplicate alert protection
 
-Running daily must not re-notify Discord about a situation that has not changed.
-Each alerting payload gets a stable fingerprint:
+Each core metric alerts **at most once per billing period**. Every alert has
+its own key:
 
 ```
-alert_key = sha1(client_name | billing_period_end | sorted(alert_types))
+usage alert:   sha1(client_name | billing_period_end date | usage:<metric_id>)
+client failure: sha1(client_name | failure | client_failed:<error_type>)
 ```
 
-Sent keys are remembered in `.alert_state.json` (gitignored, written
-atomically, pruned after `ALERT_STATE_RETENTION_DAYS`). A repeat is marked
-`suppressed_duplicate: true`, and the n8n Code node will not build a Discord
-message for it.
+The alert type names only the metric, never the percentage, so 95%, 99% and
+105% are the same condition: once `usage:active_profiles` has been delivered
+for a period, Profiles stays silent until the next period (new end date, new
+key). There is no separate over-limit alert. Each metric has its own key, so a
+later SMS or Email crossing 95% still alerts - at most three usage alerts per
+client per period.
 
-A **new** alert still fires, because the key changes when:
+Delivered keys are remembered in Postgres (`klaviyo_alert_history`, one row per
+metric) or, without a database, `.alert_state.json`. A metric already alerted
+this period is moved out of `reasons` / `alert_types` into `already_alerted`;
+when nothing new remains, `should_remind` is false and the client is not sent.
 
-- the billing period rolls over (`billing_period_end` changes)
-- usage escalates (`high_usage:sms_credits` -> `over_limit:sms_credits`)
-- another metric joins the alert
-- a different client is affected
-
-Failures get their own key (`client_failed:auth`), so a broken key alerts once
-rather than every morning. `ALERT_COOLDOWN_HOURS` (default 168 = weekly) lets an
-unchanged condition re-alert eventually; set it to `0` to never repeat.
-`--force` re-sends regardless. State is only written after n8n accepts the
-payload, so a webhook outage retries next run instead of losing the alert.
+Failures keep `ALERT_COOLDOWN_HOURS` (default 168 = weekly), so a broken key
+does not alert every morning. `--force` re-sends regardless. State is only
+written after n8n accepts the payload, so a webhook outage retries next run
+instead of losing the alert.
 
 ## n8n + Discord
 
@@ -424,11 +423,13 @@ Discord's webhook rate limit, and retries 3 times.
 
 ## Reminder logic
 
-`should_remind` is true when **any** of these hold:
+`should_remind` is true only when a **core** metric is at or above
+`USAGE_ALERT_PERCENT` (95%) **and** that metric has not already alerted this
+billing period. Days remaining in the period never trigger an alert; billing
+dates and `days_until_billing` are still collected and shown in the report.
 
-1. `days_until_billing <= REMINDER_DAYS`
-2. a **core** metric is over its limit
-3. a **core** metric is at or above `HIGH_USAGE_PERCENT`
+Only clients with a new usage alert, or a (non-duplicate) client failure, are
+POSTed to n8n. Quiet clients are checked and reported locally but never sent.
 
 Core metrics (`ALERTABLE_USAGE_METRICS`): profiles, email, SMS. Every other
 metric - AI credits, reviews, Customer Hub, K Social, and anything Klaviyo adds

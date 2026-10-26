@@ -125,8 +125,9 @@ CLIENTS_FILE = _project_path(
     os.getenv("KLAVIYO_CLIENTS_FILE", "").strip() or "clients.json"
 )
 
-REMINDER_DAYS = _env_int("REMINDER_DAYS", 3)
-HIGH_USAGE_PERCENT = _env_float("HIGH_USAGE_PERCENT", 90.0)
+# A core metric at or above this percentage raises its one usage alert for the
+# billing period. Days remaining in the period never trigger an alert.
+USAGE_ALERT_PERCENT = _env_float("USAGE_ALERT_PERCENT", 95.0)
 
 # Clients are processed in parallel; each has its own Klaviyo rate-limit
 # bucket, so this is bounded by local resources, not by Klaviyo.
@@ -154,15 +155,16 @@ USE_ESTIMATION_FALLBACK = os.getenv(
 ).strip().lower() in {"1", "true", "yes"}
 
 # --- duplicate alert suppression -----------------------------------------
-# An alert is identified by client + billing period end + the set of alert
-# types. Re-running the script therefore cannot re-notify Discord about an
-# unchanged situation, but an escalation (high usage -> over limit) or a new
-# billing period produces a new key and does alert.
+# A usage alert is identified by client + billing period end + metric, so
+# each core metric alerts at most once per billing period no matter how far
+# usage climbs afterwards; a new billing period produces a new key. Client
+# failures are identified by client + error type.
 ALERT_STATE_FILE = _project_path(
     os.getenv("ALERT_STATE_FILE", "").strip() or ".alert_state.json"
 )
 
-# Hours before an unchanged alert is allowed to fire again. 0 = never repeat.
+# Hours before an unchanged client-failure alert may fire again. 0 = never
+# repeat. Usage alerts ignore this: they never repeat within a period.
 ALERT_COOLDOWN_HOURS = _env_float("ALERT_COOLDOWN_HOURS", 168.0)  # weekly
 
 # Drop remembered alerts older than this so the state file cannot grow forever.
@@ -192,7 +194,7 @@ _PLACEHOLDER_PATTERNS = (
 )
 
 # billing-usage resource id -> (payload prefix, human label, important?)
-# "important" metrics drive the >= HIGH_USAGE_PERCENT reminder trigger.
+# Only ALERTABLE_USAGE_METRICS below can raise a usage alert.
 USAGE_METRICS: Dict[str, Tuple[str, str, bool]] = {
     "active_profiles": ("profile", "Profiles", True),
     "email_sends": ("email", "Email", True),
@@ -201,8 +203,8 @@ USAGE_METRICS: Dict[str, Tuple[str, str, bool]] = {
     "reviews_orders": ("reviews", "Reviews", False),
 }
 
-# The only billing-usage ids that can raise a usage alert (high usage or over
-# limit). Everything else - AI credits, reviews, Customer Hub, K Social and any
+# The only billing-usage ids that can raise a usage alert (>= 95% or over a
+# zero allowance). Everything else - AI credits, reviews, Customer Hub, K Social and any
 # metric Klaviyo adds later - is still reported but never flags an account.
 # Add-on allowances are often tiny (e.g. 250) and routinely read thousands of
 # percent "over", which drowned out the real billing warnings.
@@ -554,14 +556,18 @@ def parse_billing_usage(billing_response: Dict[str, Any]) -> Dict[str, Any]:
         if limit is not None and limit > 0:
             percent = round((used / limit) * 100.0, 2)
             over_limit = used > limit
+            # Compare unrounded, so 94.996% does not round its way to an alert.
+            high_usage = (used / limit) * 100.0 >= USAGE_ALERT_PERCENT
         elif limit == 0:
             # A published allowance of zero: any usage at all is an overage.
             percent = None
             over_limit = used > 0
+            high_usage = over_limit
         else:
             # usage_max is null -> unlimited or not applicable.
             percent = None
             over_limit = False
+            high_usage = False
 
         _, label, important = USAGE_METRICS.get(
             metric_id, (metric_id, metric_id.replace("_", " ").title(), False)
@@ -575,7 +581,7 @@ def parse_billing_usage(billing_response: Dict[str, Any]) -> Dict[str, Any]:
             "unit": attributes.get("unit"),
             "percent": percent,
             "over_limit": over_limit,
-            "high_usage": percent is not None and percent >= HIGH_USAGE_PERCENT,
+            "high_usage": high_usage,
         }
 
         if period_start is None:
@@ -859,39 +865,20 @@ def collect_recipients(
 # ============================================================
 
 def build_reminder(
-    metrics: Dict[str, Dict[str, Any]], days_until_billing: int
+    metrics: Dict[str, Dict[str, Any]]
 ) -> Tuple[bool, List[str], List[str]]:
     """
-    Flag the account when the billing period is nearly over, or a metric in
-    ALERTABLE_USAGE_METRICS is over or close to its limit.
+    Flag every metric in ALERTABLE_USAGE_METRICS at or above
+    USAGE_ALERT_PERCENT. How many days are left in the billing period plays
+    no part: only usage alerts.
 
     Returns (should_remind, human reasons, machine-readable alert types).
-    The alert types are what duplicate suppression keys off, so an account
-    that escalates from "high usage" to "over limit" alerts again.
+    There is one alert type per metric - `usage:<metric_id>` - whatever the
+    percentage, so 95%, 99% and 105% are the same condition and duplicate
+    suppression lets each metric alert only once per billing period.
     """
     reasons: List[str] = []
     alert_types: List[str] = []
-
-    period_due = days_until_billing <= REMINDER_DAYS
-    if period_due:
-        alert_types.append("billing_period_ending")
-        if days_until_billing < 0:
-            reasons.append(
-                "Billing period ended {} day{} ago".format(
-                    abs(days_until_billing), "" if abs(days_until_billing) == 1 else "s"
-                )
-            )
-        elif days_until_billing == 0:
-            reasons.append("Billing period ends today")
-        else:
-            reasons.append(
-                "Billing period ends in {} day{}".format(
-                    days_until_billing, "" if days_until_billing == 1 else "s"
-                )
-            )
-
-    over_limit = False
-    high_usage = False
 
     # Stable order so Discord messages do not shuffle between runs.
     for metric_id in sorted(
@@ -901,22 +888,17 @@ def build_reminder(
         if metric_id not in ALERTABLE_USAGE_METRICS:
             continue
         metric = metrics[metric_id]
-        if metric["over_limit"]:
-            over_limit = True
-            alert_types.append("over_limit:{}".format(metric_id))
-            reasons.append(
-                "{} usage is over its limit ({}%)".format(
-                    metric["label"], metric["percent"]
-                )
-            )
-        elif metric["high_usage"] and metric["important"]:
-            high_usage = True
-            alert_types.append("high_usage:{}".format(metric_id))
+        if not metric["high_usage"]:
+            continue
+        alert_types.append("usage:{}".format(metric_id))
+        if metric["percent"] is None:
+            reasons.append("{} usage is over its zero allowance".format(metric["label"]))
+        else:
             reasons.append(
                 "{} usage is at {}%".format(metric["label"], metric["percent"])
             )
 
-    return (period_due or over_limit or high_usage), reasons, alert_types
+    return bool(alert_types), reasons, alert_types
 
 
 # ============================================================
@@ -946,10 +928,16 @@ def build_payload(client_name: str) -> Dict[str, Any]:
         "campaigns_with_recipient_data": None,
         "total_estimated_recipients": None,
         "average_recipients_per_email": None,
+        # should_remind / reasons / alert_types describe only alerts that are
+        # new this billing period; usage_alerts is every core metric at or
+        # above the threshold, already alerted or not.
         "should_remind": False,
         "reasons": [],
         "alert_types": [],
+        "usage_alerts": [],
         "alert_key": None,
+        "alert_keys": [],
+        "already_alerted": [],
         "suppressed_duplicate": False,
         "previously_alerted_at": None,
         "warnings": [],
@@ -1042,15 +1030,19 @@ def process_client(record: "ClientRecord") -> Dict[str, Any]:
         })
 
         # --- 5. Reminder decision -----------------------------------------
-        should_remind, reasons, alert_types = build_reminder(
-            metrics, days_until_billing
-        )
+        # Candidates only: mark_duplicates() later narrows these to the
+        # metrics that have not yet alerted this billing period.
+        should_remind, reasons, alert_types = build_reminder(metrics)
 
         payload.update({
             "success": True,
             "should_remind": should_remind,
             "reasons": reasons,
             "alert_types": alert_types,
+            "usage_alerts": [
+                {"alert_type": alert_type, "reason": reason}
+                for alert_type, reason in zip(alert_types, reasons)
+            ],
             "warnings": warnings,
         })
 
@@ -1270,27 +1262,51 @@ def _clients_from_json() -> List[ClientRecord]:
 # DUPLICATE ALERT SUPPRESSION
 # ============================================================
 
-def alert_identity(payload: Dict[str, Any]) -> Tuple[List[str], Optional[str]]:
+def _alert_key(client_name: str, scope: str, alert_type: str) -> str:
+    raw = "{}|{}|{}".format(client_name, scope, alert_type)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _usage_candidates(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Every core usage condition on this payload, already alerted or not."""
+    if "usage_alerts" in payload:
+        return list(payload.get("usage_alerts") or [])
+    # Payloads built before usage_alerts existed carry the types alone.
+    return [{"alert_type": t, "reason": t} for t in payload.get("alert_types") or []]
+
+
+def alert_identity(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
     """
-    Machine-readable alert types plus a stable key for this payload.
+    (alert_type, alert_key) for every alert this payload could raise.
+
+    A usage alert's key is client + billing period end + alert type, and the
+    alert type names only the metric (`usage:active_profiles`), never the
+    percentage. So 95%, 99% and 105% share one key and alert once, while a
+    new billing period has a new key and may alert again. Each metric has
+    its own key, so Profiles alerting does not suppress SMS.
+
+    A client failure's key is client + error type.
 
     Successful-and-quiet accounts have no alert identity at all - they are
     never notified, so they must never occupy a dedupe slot.
     """
-    if not payload.get("success"):
-        alert_types = ["client_failed:{}".format(payload.get("error_type") or "unknown")]
-        scope = "failure"
-    elif payload.get("should_remind"):
-        alert_types = list(payload.get("alert_types") or [])
-        # Billing period end scopes the key so a new period always re-alerts.
-        scope = payload.get("billing_period_end") or "unknown-period"
-    else:
-        return [], None
+    client_name = payload.get("client_name", "")
 
-    raw = "{}|{}|{}".format(
-        payload.get("client_name", ""), scope, ",".join(sorted(alert_types))
+    if not payload.get("success"):
+        alert_type = "client_failed:{}".format(payload.get("error_type") or "unknown")
+        return [(alert_type, _alert_key(client_name, "failure", alert_type))]
+
+    # The period-end date, so timestamp formatting jitter between daily runs
+    # can never look like a new billing period.
+    period_end = parse_iso(payload.get("billing_period_end"))
+    scope = (
+        period_end.date().isoformat() if period_end
+        else payload.get("billing_period_end") or "unknown-period"
     )
-    return alert_types, hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+    return [
+        (alert["alert_type"], _alert_key(client_name, scope, alert["alert_type"]))
+        for alert in _usage_candidates(payload)
+    ]
 
 
 def load_alert_state(path: str) -> Dict[str, str]:
@@ -1332,17 +1348,10 @@ def save_alert_state(path: str, state: Dict[str, str]) -> None:
 
 
 def assign_alert_identity(results: List[Dict[str, Any]]) -> List[str]:
-    """
-    Stamp `alert_key` / `alert_types` on every payload and return the keys
-    that actually need a duplicate check.
-    """
+    """Return every alert key on these payloads that needs a duplicate check."""
     keys: List[str] = []
     for payload in results:
-        alert_types, key = alert_identity(payload)
-        payload["alert_types"] = alert_types
-        payload["alert_key"] = key
-        if key:
-            keys.append(key)
+        keys.extend(key for _, key in alert_identity(payload))
     return keys
 
 
@@ -1350,42 +1359,80 @@ def mark_duplicates(
     results: List[Dict[str, Any]], state: Dict[str, str], force: bool
 ) -> None:
     """
-    Annotate each payload with `alert_key` and `suppressed_duplicate`.
+    Decide which alerts are new and narrow each payload to them.
 
     `state` maps alert_key -> ISO timestamp of the last delivery, whether it
     came from Postgres or the local file.
 
-    Nothing is dropped here: n8n still receives the full picture and simply
-    gates its Discord node on `should_remind && !suppressed_duplicate`.
+    Usage alerts: a metric already alerted this billing period is dropped
+    from `reasons` / `alert_types` / `alert_keys` and listed in
+    `already_alerted` instead; `should_remind` is true only when at least one
+    metric is new. There is no cooldown - the billing period is the window.
+
+    Client failures keep their cooldown (ALERT_COOLDOWN_HOURS).
+
+    Safe to call repeatedly: the candidates in `usage_alerts` are never
+    modified, only the fields derived from them.
     """
     now = now_utc()
-    assign_alert_identity(results)
 
     for payload in results:
-        key = payload.get("alert_key")
+        identities = alert_identity(payload)
 
-        if key is None:
-            payload["suppressed_duplicate"] = False
-            payload["previously_alerted_at"] = None
+        if not payload.get("success"):
+            alert_type, key = identities[0]
+            previous = parse_iso(state.get(key))
+            if force or previous is None:
+                suppressed = False
+            elif ALERT_COOLDOWN_HOURS <= 0:
+                suppressed = True
+            else:
+                elapsed_hours = (now - previous).total_seconds() / 3600.0
+                suppressed = elapsed_hours < ALERT_COOLDOWN_HOURS
+            payload.update({
+                "alert_types": [alert_type],
+                "alert_keys": [key],
+                "alert_key": key,
+                "already_alerted": [],
+                "suppressed_duplicate": suppressed,
+                "previously_alerted_at": previous.isoformat() if previous else None,
+            })
             continue
 
-        previous = parse_iso(state.get(key))
-        payload["previously_alerted_at"] = previous.isoformat() if previous else None
+        new: List[Dict[str, Any]] = []
+        seen: List[Dict[str, Any]] = []
+        for alert, (_, key) in zip(_usage_candidates(payload), identities):
+            previous = parse_iso(state.get(key))
+            entry = dict(alert, alert_key=key,
+                         alerted_at=previous.isoformat() if previous else None)
+            (seen if previous is not None and not force else new).append(entry)
 
-        if force or previous is None:
-            payload["suppressed_duplicate"] = False
-        elif ALERT_COOLDOWN_HOURS <= 0:
-            payload["suppressed_duplicate"] = True
-        else:
-            elapsed_hours = (now - previous).total_seconds() / 3600.0
-            payload["suppressed_duplicate"] = elapsed_hours < ALERT_COOLDOWN_HOURS
+        keys = [alert["alert_key"] for alert in new]
+        payload.update({
+            "should_remind": bool(new),
+            "reasons": [alert["reason"] for alert in new],
+            "alert_types": [alert["alert_type"] for alert in new],
+            "alert_keys": keys,
+            "alert_key": ",".join(keys) or None,
+            "already_alerted": [
+                {"alert_type": a["alert_type"], "alerted_at": a["alerted_at"]}
+                for a in seen
+            ],
+            # Every usage condition on this client has already been alerted.
+            "suppressed_duplicate": bool(seen) and not new,
+            "previously_alerted_at": max(
+                (a["alerted_at"] for a in seen), default=None
+            ),
+        })
 
 
 def record_alert(state: Dict[str, str], payload: Dict[str, Any]) -> None:
     """Remember an alert only once it has actually reached n8n."""
-    key = payload.get("alert_key")
-    if key and not payload.get("suppressed_duplicate"):
-        state[key] = now_utc().isoformat()
+    if payload.get("suppressed_duplicate"):
+        return
+    stamp = now_utc().isoformat()
+    for key in payload.get("alert_keys") or []:
+        state[key] = stamp
 
 
 class FileAlertStore:
@@ -1434,16 +1481,17 @@ class PostgresAlertStore:
     def persist(self, results: List[Dict[str, Any]], state: Dict[str, str]) -> None:
         entries = []
         for payload in results:
-            key = payload.get("alert_key")
-            if not key or key not in state:
-                continue
-            entries.append({
-                "alert_key": key,
-                "client_id": payload.get("client_id"),
-                "client_name": payload.get("client_name") or "",
-                "billing_period_end": parse_iso(payload.get("billing_period_end")),
-                "alert_types": list(payload.get("alert_types") or []),
-            })
+            # One row per alert: each usage metric is remembered separately.
+            for alert_type, key in alert_identity(payload):
+                if key not in state:
+                    continue
+                entries.append({
+                    "alert_key": key,
+                    "client_id": payload.get("client_id"),
+                    "client_name": payload.get("client_name") or "",
+                    "billing_period_end": parse_iso(payload.get("billing_period_end")),
+                    "alert_types": [alert_type],
+                })
 
         try:
             self._db.record_alerts(entries)
@@ -1761,9 +1809,9 @@ def print_summary(
         for index, reason in enumerate(payload.get("reasons") or []):
             print(_row("Reasons" if index == 0 else "", "- " + reason))
 
-        if payload.get("suppressed_duplicate"):
-            print(_row("Duplicate", "already alerted {}".format(
-                payload.get("previously_alerted_at") or "earlier")))
+        for alert in payload.get("already_alerted") or []:
+            print(_row("Already alerted", "{} ({})".format(
+                alert["alert_type"], alert.get("alerted_at") or "earlier")))
 
         for warning in payload.get("warnings") or []:
             print(_row("Warning", warning))
@@ -1784,7 +1832,7 @@ def print_summary(
     print(_row("Clients checked", str(len(results))))
     print(_row("Succeeded", str(len(succeeded))))
     print(_row("Failed", str(len(failed))))
-    print(_row("Flagged for review", str(len(flagged))))
+    print(_row("New usage alerts", str(len(flagged))))
     print(_row("Duplicates suppressed", str(len(suppressed))))
     if delivered or undelivered:
         print(_row("Delivered to n8n", str(len(delivered))))
@@ -1811,7 +1859,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--remind-only", action="store_true",
-        help="only send clients where should_remind is true",
+        help="no-op, kept for existing schedules: only clients with a new "
+             "alert are ever sent",
     )
     parser.add_argument(
         "--out", help="also write all payloads to this JSON file",
@@ -1881,20 +1930,28 @@ def main() -> int:
     suppressed = [r for r in results if r.get("suppressed_duplicate")]
 
     logger.info(
-        "Done: %d ok, %d failed, %d flagged, %d will notify, %d suppressed as duplicates",
+        "Done: %d ok, %d failed, %d new usage alert(s), %d will notify, "
+        "%d suppressed as duplicates",
         len(succeeded), len(failed), len(flagged), len(actionable), len(suppressed),
     )
     for result in failed:
         logger.warning(
             "  failed: %s (%s)", result["client_name"], result["error_type"]
         )
-    for result in suppressed:
+    for result in flagged:
         logger.info(
-            "  duplicate: %s (already alerted %s)",
-            result["client_name"], result.get("previously_alerted_at"),
+            "  new alert: %s - %s", result["client_name"], "; ".join(result["reasons"])
         )
+    for result in results:
+        for alert in result.get("already_alerted") or []:
+            logger.info(
+                "  already alerted this period: %s %s (%s)",
+                result["client_name"], alert["alert_type"], alert["alerted_at"],
+            )
 
-    outgoing = actionable if args.remind_only else results
+    # Quiet clients, and alerts already delivered this billing period, are
+    # never sent: every POST to n8n is a Discord-worthy alert.
+    outgoing = actionable
 
     # ------------------------------------------------------------------
     # Optional delivery. Any failure here is reported, never fatal, and
